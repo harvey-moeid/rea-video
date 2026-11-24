@@ -1,0 +1,33 @@
+# REA VIDEO API + PWA (single origin so one Cloudflare Access app protects both).
+# No secrets here. Secrets are set with `wrangler secret put` (see docs/deployment/secrets.md).
+name = "rea-video"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+
+[assets]
+directory = "../web"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "rea-video-storage"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "rea-video-db"
+database_id = "cd3ece43-4d12-4e69-9347-e7c11b62fbee"
+
+[triggers]
+crons = ["17 */6 * * *"] # abort abandoned multipart uploads only; never deletes user data
+
+[vars]
+R2_BUCKET_NAME = "rea-video-storage"
+GITHUB_REPO = "harvey-moeid/rea-video"
+GITHUB_REF = "byga-integration"
+GITHUB_WORKFLOW = "analyze-r2.yml"
+MAX_UPLOAD_BYTES = "209715200"   # 200 MiB until benchmarked on a real runner
+MAX_CONCURRENT_JOBS = "2"
+# Set after creating the Access application (not secrets, but account-specific):
+# ACCESS_TEAM_DOMAIN = "<team>.cloudflareaccess.com"
+# ACCESS_AUD = "<application AUD tag>"

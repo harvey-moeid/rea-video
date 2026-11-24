@@ -1,5 +1,5 @@
 -- Baseline schema, reconstructed from the live D1 database `rea-video-db`
--- (cd3ece43-4d12-4e69-9347-e7c11b62fbee) on 2024-11-24. Already applied; kept here so tests
+-- (cd3ece43-4d12-4e69-9347-e7c11b62fbee) on 2026-11-24. Already applied; kept here so tests
 -- and fresh environments can build the same structure.
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
