@@ -1,0 +1,126 @@
+name: Analyze video from R2
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Opaque job ID
+        required: true
+        type: string
+      input_key:
+        description: Exact source object key in the private R2 bucket
+        required: true
+        type: string
+      output_prefix:
+        description: Output prefix for this job
+        required: true
+        type: string
+      language:
+        description: Report language
+        required: true
+        default: en
+        type: choice
+        options: [en, zh]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rea-video-analysis-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          INPUT_KEY: ${{ inputs.input_key }}
+          OUTPUT_PREFIX: ${{ inputs.output_prefix }}
+        run: |
+          [[ "$JOB_ID" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo "Invalid job_id"; exit 1; }
+          [[ "$INPUT_KEY" != /* && "$INPUT_KEY" != *".."* && "$INPUT_KEY" == users/*/jobs/*/input/* ]] || { echo "Invalid input_key"; exit 1; }
+          [[ "$OUTPUT_PREFIX" != /* && "$OUTPUT_PREFIX" != *".."* && "$OUTPUT_PREFIX" == users/*/jobs/* ]] || { echo "Invalid output_prefix"; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install FFmpeg and project
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Configure R2 S3 endpoint
+        id: r2
+        shell: bash
+        env:
+          ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          for name in ACCOUNT_ID ACCESS_KEY_ID SECRET_ACCESS_KEY BUCKET; do
+            if [[ -z "${!name}" ]]; then echo "Missing GitHub Actions secret: $name"; exit 1; fi
+          done
+          python -m pip install --upgrade awscli
+          echo "endpoint=https://$ACCOUNT_ID.r2.cloudflarestorage.com" >> "$GITHUB_OUTPUT"
+
+      - name: Download original video from private R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: ${{ steps.r2.outputs.endpoint }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+          INPUT_KEY: ${{ inputs.input_key }}
+        run: |
+          mkdir -p work/input work/output
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$R2_BUCKET/$INPUT_KEY" work/input/original-video --only-show-errors
+          test -s work/input/original-video
+          file work/input/original-video
+
+      - name: Run rea-video analysis
+        env:
+          REPORT_LANG: ${{ inputs.language }}
+        run: |
+          rea-video decompose work/input/original-video \
+            --out work/output \
+            --lang "$REPORT_LANG" \
+            --no-vlm
+
+      - name: Upload analysis outputs to private R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: ${{ steps.r2.outputs.endpoint }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+          OUTPUT_PREFIX: ${{ inputs.output_prefix }}
+        run: |
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp work/output/ "s3://$R2_BUCKET/$OUTPUT_PREFIX/" \
+            --recursive --only-show-errors
+
+      - name: Upload diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rea-video-run-${{ inputs.job_id }}
+          path: work/output/
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Clean runner workspace
+        if: always()
+        run: rm -rf work
