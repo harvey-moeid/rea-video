@@ -376,6 +376,9 @@ export async function cleanupStaleUploads(env, nowMs = Date.now()) {
     if (j.upload_id) await env.BUCKET.resumeMultipartUpload(j.input_key, j.upload_id).abort().catch(() => {});
     await env.DB.prepare("UPDATE jobs SET status = 'FAILED', error_message = 'upload abandoned and aborted', upload_id = NULL, updated_at = ? WHERE id = ? AND status = 'UPLOADING'").bind(nowIso(), j.id).run();
   }
+  // analyses that never reported back (runner crashed, secrets missing): fail them so the user can retry
+  const stuckCutoff = new Date(nowMs - 3 * 3600_000).toISOString();
+  await env.DB.prepare("UPDATE jobs SET status = 'FAILED', error_message = 'analysis timed out without a result', updated_at = ? WHERE status IN ('QUEUED','PROCESSING') AND updated_at < ?").bind(nowIso(), stuckCutoff).run();
   await env.DB.prepare("DELETE FROM idempotency_keys WHERE created_at < ?").bind(Math.floor(nowMs / 1000) - 86400).run();
   return stale.results.length;
 }

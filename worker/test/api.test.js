@@ -257,3 +257,17 @@ test("stale unfinished uploads are aborted and marked FAILED; verified jobs unto
   assert.ok(ctx.env.BUCKET.objects.has(ok.key));
   ctx.net.restore();
 });
+
+test("jobs stuck in QUEUED/PROCESSING for 3h are failed by the sweeper so they can be retried", async () => {
+  const ctx = await setup();
+  const { id } = await readyJob(ctx, "alice");
+  await ctx.call("alice", "POST", `/api/jobs/${id}/analyze`);
+  await cleanupStaleUploads(ctx.env);
+  assert.equal((await ctx.call("alice", "GET", `/api/jobs/${id}`)).body.job.status, "QUEUED");
+  await ctx.env.DB.prepare("UPDATE jobs SET updated_at = '2020-01-01T00:00:00.000Z'").run();
+  await cleanupStaleUploads(ctx.env);
+  const j = (await ctx.call("alice", "GET", `/api/jobs/${id}`)).body.job;
+  assert.equal(j.status, "FAILED"); assert.match(j.error, /timed out/);
+  assert.equal((await ctx.call("alice", "POST", `/api/jobs/${id}/analyze`)).status, 202);
+  ctx.net.restore();
+});
