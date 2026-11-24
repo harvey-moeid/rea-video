@@ -1,6 +1,6 @@
 // REA VIDEO API Worker. Heavy processing never runs here: uploads go straight to R2 via presigned
 // URLs, analysis runs in GitHub Actions, results come back through an HMAC-authenticated callback.
-import { SESSION_COOKIE, authConfigured, checkPassword, createSession, verifyCallback, verifySession } from "./auth.js";
+import { SESSION_COOKIE, apiTokenConfigured, authConfigured, checkPassword, createSession, verifyApiToken, verifyCallback, verifySession } from "./auth.js";
 import { presignR2, sha256Hex } from "./sigv4.js";
 import {
   DEFAULT_MAX_UPLOAD_BYTES, JOB_ID_RE, MAX_PARTS_PER_REQUEST, PART_SIZE, SINGLE_PUT_MAX,
@@ -306,7 +306,18 @@ async function internal(env, request, url, id, action) {
 }
 
 // ---------- router ----------
-const authenticate = (env, request) => verifySession(env, request.headers.get("cookie"));
+// Session cookie (browser) or Bearer API token (scripts). Returns { auth } or { response } to send back.
+async function authenticate(env, request) {
+  const session = await verifySession(env, request.headers.get("cookie"));
+  if (session) return { auth: session };
+  const tok = await verifyApiToken(env, request.headers.get("authorization"));
+  if (tok.state === "ok") return { auth: { userId: tok.userId } };
+  if (tok.state === "bad") {
+    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    if (!(await rateLimit(env.DB, `apitoken:${ip}`, 30, 900))) return { response: json({ error: "too many failed attempts" }, 429, { "retry-after": "900" }) };
+  }
+  return { response: err(401, "unauthorized") };
+}
 
 function sessionCookie(url, value, maxAge) {
   // Secure only over https so local http testing still works; production Workers are always https.
@@ -345,10 +356,10 @@ export async function handleApi(request, env) {
   if (path === "/api/login" && method === "POST") return login(env, request, url);
   if (path === "/api/logout" && method === "POST") return json({ ok: true }, 200, { "set-cookie": sessionCookie(url, "", 0) });
 
-  if (!authConfigured(env)) return err(503, "authentication is not configured");
-  const auth = await authenticate(env, request);
-  if (!auth) return err(401, "unauthorized");
-  const { userId } = auth;
+  if (!authConfigured(env) && !apiTokenConfigured(env)) return err(503, "authentication is not configured");
+  const result = await authenticate(env, request);
+  if (result.response) return result.response;
+  const { userId } = result.auth;
 
   if (path === "/api/me" && method === "GET") return json({ user: "owner", user_id: userId.slice(0, 8) });
   if (path === "/api/status" && method === "GET") {

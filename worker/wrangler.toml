@@ -29,4 +29,5 @@ GITHUB_WORKFLOW = "analyze-r2.yml"
 MAX_UPLOAD_BYTES = "209715200"   # 200 MiB until benchmarked on a real runner
 MAX_CONCURRENT_JOBS = "2"
 # Login needs two Worker secrets (never put them here): AUTH_PASSWORD (>= 8 chars) and SESSION_SECRET (>= 32 random chars).
+# Optional: API_TOKEN (>= 32 chars) enables `Authorization: Bearer` access for scripts.
 # See docs/deployment/secrets.md.

@@ -16,7 +16,8 @@ The Worker shows a password form and, after a correct password, sets an `HttpOnl
 3. Until both are set and long enough, `/api/login` and the API answer 503 (fail closed).
 4. Changing `AUTH_PASSWORD` or `SESSION_SECRET` signs every device out immediately.
 5. Wrong guesses are limited to 10 attempts per 15 minutes per IP address (counted in D1).
-6. Do not put any Cloudflare Access policy in front of this Worker anymore; the GitHub runner reaches `/api/internal/*` directly and is authenticated by the HMAC callback.
+6. Optional machine access (scripts, MCP tools): set Worker secret `API_TOKEN` (>= 32 random chars). Callers send `Authorization: Bearer <API_TOKEN>` on any `/api/*` endpoint (no login or cookie needed) and act as the same Owner account. Unset it to disable; rotate it by replacing the secret. Failed token attempts are limited to 30 per 15 minutes per IP.
+7. Do not put any Cloudflare Access policy in front of this Worker anymore; the GitHub runner reaches `/api/internal/*` directly and is authenticated by the HMAC callback.
 
 ## 2. R2 S3 credentials (two separate tokens, least privilege)
 Create R2 API tokens scoped to bucket `rea-video-storage` only:
@@ -31,6 +32,7 @@ Create R2 API tokens scoped to bucket `rea-video-storage` only:
 | `GITHUB_TOKEN` | fine-grained PAT, only repo `harvey-moeid/rea-video`, permission **Actions: Read and write** |
 | `AUTH_PASSWORD` | the login password (>= 8 chars) |
 | `SESSION_SECRET` | signs the session cookie (>= 32 random chars) |
+| `API_TOKEN` (optional) | Bearer token for scripts/MCP (>= 32 random chars) |
 | `CALLBACK_SECRET` | >= 32 random chars (`openssl rand -hex 32`); same value as GitHub `WORKER_CALLBACK_SECRET` |
 
 ## 4. GitHub Actions secrets (repo Settings > Secrets > Actions)

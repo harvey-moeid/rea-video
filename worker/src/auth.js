@@ -15,6 +15,7 @@ export const SESSION_COOKIE = "rea_session";
 export const SESSION_TTL_SEC = 30 * 24 * 3600;
 export const MIN_PASSWORD_LENGTH = 8;
 export const MIN_SESSION_SECRET_LENGTH = 32;
+export const MIN_API_TOKEN_LENGTH = 32;
 
 export async function hmacHex(secret, message) {
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -79,6 +80,17 @@ export async function verifySession(env, cookieHeader, nowSec = Math.floor(Date.
   } catch {
     return null;
   }
+}
+
+/** Optional machine access (scripts, MCP tools): `Authorization: Bearer <API_TOKEN>`. Off unless the secret is set. */
+export const apiTokenConfigured = (env) => typeof env.API_TOKEN === "string" && env.API_TOKEN.length >= MIN_API_TOKEN_LENGTH;
+
+/** "none" = no bearer header, "ok" = valid, "bad" = present but wrong/disabled. Never throws. */
+export async function verifyApiToken(env, authorizationHeader) {
+  const m = /^Bearer\s+(\S{1,512})$/i.exec(String(authorizationHeader || "").trim());
+  if (!authorizationHeader) return { state: "none" };
+  if (!m || !apiTokenConfigured(env)) { await safeEqual("x", "y"); return { state: "bad" }; }
+  return (await safeEqual(env.API_TOKEN, m[1])) ? { state: "ok", userId: await ownerUserId() } : { state: "bad" };
 }
 
 /** Opaque, stable, key-safe id of the single account that owns every job. */

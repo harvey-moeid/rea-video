@@ -103,6 +103,30 @@ test("sessions: tampered, expired and password-changed cookies are rejected", as
   ctx.net.restore();
 });
 
+test("API token: Bearer works without a cookie, wrong/short/disabled tokens do not, failures are rate limited", async () => {
+  const TOKEN = "t".repeat(40);
+  const ctx = await setup({ API_TOKEN: TOKEN });
+  const bearer = (t, extra = {}) => worker.fetch(new Request("https://app.test/api/jobs", { headers: { authorization: `Bearer ${t}`, "cf-connecting-ip": "192.0.2.1", ...extra } }), ctx.env);
+  assert.equal((await bearer(TOKEN)).status, 200);
+  const created = await worker.fetch(new Request("https://app.test/api/jobs", { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ filename: "a.mp4", size: 10, content_type: "video/mp4" }) }), ctx.env);
+  assert.equal(created.status, 201);
+  assert.equal((await ctx.call("alice", "GET", "/api/jobs")).body.jobs.length, 1, "token and browser session are the same account");
+  assert.equal((await bearer("x".repeat(40), { "cf-connecting-ip": "192.0.2.2" })).status, 401);
+  assert.equal((await bearer("short", { "cf-connecting-ip": "192.0.2.2" })).status, 401);
+  const basic = await worker.fetch(new Request("https://app.test/api/jobs", { headers: { authorization: `Basic ${TOKEN}` } }), ctx.env);
+  assert.equal(basic.status, 401);
+  let last; for (let i = 0; i < 31; i++) last = await bearer("w".repeat(40), { "cf-connecting-ip": "192.0.2.3" });
+  assert.equal(last.status, 429);
+  const off = await setup({ API_TOKEN: "" });
+  assert.equal((await worker.fetch(new Request("https://app.test/api/jobs", { headers: { authorization: `Bearer ${TOKEN}` } }), off.env)).status, 401);
+  const short = await setup({ API_TOKEN: "t".repeat(31), AUTH_PASSWORD: "" });
+  assert.equal((await worker.fetch(new Request("https://app.test/api/jobs", { headers: { authorization: `Bearer ${"t".repeat(31)}` } }), short.env)).status, 503);
+  // token-only deployment (no password configured) still works
+  const only = await setup({ AUTH_PASSWORD: "", API_TOKEN: TOKEN });
+  assert.equal((await worker.fetch(new Request("https://app.test/api/jobs", { headers: { authorization: `Bearer ${TOKEN}` } }), only.env)).status, 200);
+  for (const c of [ctx, off, short, only]) c.net.restore();
+});
+
 test("login is rate limited per IP and rejects cross-origin posts", async () => {
   const ctx = await setup(); // setup already used 1 attempt for 203.0.113.7
   for (let i = 0; i < 9; i++) assert.equal((await ctx.rawLogin("guess " + i)).status, 401);
