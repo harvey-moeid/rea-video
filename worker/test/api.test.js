@@ -1,28 +1,31 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import worker, { cleanupStaleUploads } from "../src/index.js";
-import { _resetJwksCache, hmacHex, callbackSigningString } from "../src/auth.js";
-import { FakeR2, installFetch, makeAccess, makeDb, mp4Bytes } from "./helpers.js";
+import { hmacHex, callbackSigningString, createSession } from "../src/auth.js";
+import { FakeR2, installFetch, makeDb, mp4Bytes } from "./helpers.js";
 import { PART_SIZE } from "../src/validate.js";
 
 const SECRET = "c".repeat(48);
+const PASSWORD = "correct horse battery";
+const SESSION_SECRET = "s".repeat(48);
 
 async function setup(over = {}, githubStatus = 204) {
-  _resetJwksCache();
-  const access = await makeAccess();
   const env = {
-    DB: makeDb(), BUCKET: new FakeR2(), ACCESS_TEAM_DOMAIN: access.team, ACCESS_AUD: access.aud,
+    DB: makeDb(), BUCKET: new FakeR2(), AUTH_PASSWORD: PASSWORD, SESSION_SECRET,
     R2_ACCOUNT_ID: "acc", R2_BUCKET_NAME: "rea-video-storage", R2_ACCESS_KEY_ID: "AK", R2_SECRET_ACCESS_KEY: "SK",
     GITHUB_TOKEN: "ghp_test", GITHUB_REPO: "harvey-moeid/rea-video", GITHUB_REF: "byga-integration", CALLBACK_SECRET: SECRET,
     MAX_UPLOAD_BYTES: String(PART_SIZE * 8), ...over,
   };
-  const net = installFetch([
-    ["cloudflareaccess.com", async () => new Response(JSON.stringify({ keys: [access.jwk] }), { status: 200 })],
-    ["api.github.com", async () => new Response(null, { status: githubStatus })],
-  ]);
+  const net = installFetch([["api.github.com", async () => new Response(null, { status: githubStatus })]]);
+  const rawLogin = (password, headers = {}) => worker.fetch(new Request("https://app.test/api/login", {
+    method: "POST", headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.7", ...headers }, body: JSON.stringify({ password }),
+  }), env);
+  const first = await rawLogin(PASSWORD);
+  const cookie = first.headers.get("set-cookie")?.split(";")[0] ?? null; // null when auth is not configured
+  // `who` is only a truthy "send my session cookie" flag: there is a single account
   const call = async (who, method, path, body, headers = {}) => {
     const h = { "content-type": "application/json", ...headers };
-    if (who) h["cf-access-jwt-assertion"] = await access.token(who);
+    if (who && cookie) h.cookie = cookie;
     const res = await worker.fetch(new Request("https://app.test" + path, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body) }), env);
     return { status: res.status, body: await res.json().catch(() => null), headers: res.headers };
   };
@@ -32,7 +35,7 @@ async function setup(over = {}, githubStatus = 204) {
     const res = await worker.fetch(new Request("https://app.test" + path, { method: "POST", body, headers: { "x-rea-timestamp": String(ts), "x-rea-nonce": nonce, "x-rea-signature": sig } }), env);
     return { status: res.status, body: await res.json().catch(() => null) };
   };
-  return { env, call, callback, net };
+  return { env, call, callback, net, cookie, rawLogin };
 }
 
 const create = (call, who = "alice", over = {}) => call(who, "POST", "/api/jobs", { filename: "clip.mp4", size: 2048, content_type: "video/mp4", ...over });
@@ -46,14 +49,93 @@ async function readyJob(ctx, who = "alice") {
   return { id, key };
 }
 
-test("health is public; everything else requires a valid Access JWT", async () => {
+test("health is public; everything else requires a valid session cookie", async () => {
   const ctx = await setup();
   assert.equal((await ctx.call(null, "GET", "/api/health")).status, 200);
   assert.equal((await ctx.call(null, "GET", "/api/jobs")).status, 401);
-  const bad = await worker.fetch(new Request("https://app.test/api/jobs", { headers: { "cf-access-jwt-assertion": "x.y.z" } }), ctx.env);
+  assert.equal((await ctx.call("alice", "GET", "/api/jobs")).status, 200);
+  const bad = await worker.fetch(new Request("https://app.test/api/jobs", { headers: { cookie: "rea_session=x.y" } }), ctx.env);
   assert.equal(bad.status, 401);
-  const unconfigured = await setup({ ACCESS_AUD: "" });
-  assert.equal((await unconfigured.call("alice", "GET", "/api/jobs")).status, 503);
+  // a Cloudflare Access header alone no longer authenticates anything
+  const legacy = await worker.fetch(new Request("https://app.test/api/jobs", { headers: { "cf-access-jwt-assertion": "a.b.c" } }), ctx.env);
+  assert.equal(legacy.status, 401);
+  for (const over of [{ AUTH_PASSWORD: "" }, { AUTH_PASSWORD: "short" }, { SESSION_SECRET: "tooshort" }]) {
+    const unconfigured = await setup(over);
+    assert.equal((await unconfigured.call("alice", "GET", "/api/jobs")).status, 503);
+    assert.equal((await unconfigured.rawLogin(PASSWORD)).status, 503);
+    unconfigured.net.restore();
+  }
+  ctx.net.restore();
+});
+
+test("login: wrong password is rejected, session cookie is HttpOnly/SameSite/Secure, logout clears it", async () => {
+  const ctx = await setup();
+  const wrong = await ctx.rawLogin("not the password");
+  assert.equal(wrong.status, 401); assert.equal(wrong.headers.get("set-cookie"), null);
+  for (const pw of ["", undefined, 12345, "x".repeat(300)]) assert.equal((await ctx.rawLogin(pw)).status, 401);
+  const ok = await ctx.rawLogin(PASSWORD);
+  assert.equal(ok.status, 200);
+  const cookie = ok.headers.get("set-cookie");
+  assert.match(cookie, /^rea_session=[A-Za-z0-9_-]+\.[0-9a-f]{64};/);
+  for (const attr of ["HttpOnly", "SameSite=Strict", "Secure", "Path=/", "Max-Age=2592000"]) assert.ok(cookie.includes(attr), attr);
+  assert.ok(!cookie.includes(PASSWORD) && !cookie.includes(SESSION_SECRET), "cookie must not carry secrets");
+  const me = await ctx.call("alice", "GET", "/api/me");
+  assert.equal(me.status, 200); assert.equal(me.body.user, "owner");
+  const out = await ctx.call(null, "POST", "/api/logout", {});
+  assert.equal(out.status, 200); assert.match(out.headers.get("set-cookie"), /^rea_session=; .*Max-Age=0/);
+  ctx.net.restore();
+});
+
+test("sessions: tampered, expired and password-changed cookies are rejected", async () => {
+  const ctx = await setup();
+  assert.equal((await ctx.call("alice", "GET", "/api/jobs")).status, 200);
+  const [payload, sig] = ctx.cookie.split("=")[1].split(".");
+  const forged = Buffer.from(JSON.stringify({ sub: "owner", iat: 1, exp: 9999999999 })).toString("base64url");
+  for (const c of [`rea_session=${forged}.${sig}`, `rea_session=${payload}.${"0".repeat(64)}`, `rea_session=${payload}`, "rea_session=", "other=1"]) {
+    const res = await worker.fetch(new Request("https://app.test/api/jobs", { headers: { cookie: c } }), ctx.env);
+    assert.equal(res.status, 401, c);
+  }
+  const old = await createSession(ctx.env, Math.floor(Date.now() / 1000) - 31 * 24 * 3600);
+  const expired = await worker.fetch(new Request("https://app.test/api/jobs", { headers: { cookie: `rea_session=${old.value}` } }), ctx.env);
+  assert.equal(expired.status, 401);
+  ctx.env.AUTH_PASSWORD = "a brand new password";
+  assert.equal((await ctx.call("alice", "GET", "/api/jobs")).status, 401, "changing the password logs out existing sessions");
+  ctx.net.restore();
+});
+
+test("API token: Bearer works without a cookie, wrong/short/disabled tokens do not, failures are rate limited", async () => {
+  const TOKEN = "t".repeat(40);
+  const ctx = await setup({ API_TOKEN: TOKEN });
+  const bearer = (t, extra = {}) => worker.fetch(new Request("https://app.test/api/jobs", { headers: { authorization: `Bearer ${t}`, "cf-connecting-ip": "192.0.2.1", ...extra } }), ctx.env);
+  assert.equal((await bearer(TOKEN)).status, 200);
+  const created = await worker.fetch(new Request("https://app.test/api/jobs", { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ filename: "a.mp4", size: 10, content_type: "video/mp4" }) }), ctx.env);
+  assert.equal(created.status, 201);
+  assert.equal((await ctx.call("alice", "GET", "/api/jobs")).body.jobs.length, 1, "token and browser session are the same account");
+  assert.equal((await bearer("x".repeat(40), { "cf-connecting-ip": "192.0.2.2" })).status, 401);
+  assert.equal((await bearer("short", { "cf-connecting-ip": "192.0.2.2" })).status, 401);
+  const basic = await worker.fetch(new Request("https://app.test/api/jobs", { headers: { authorization: `Basic ${TOKEN}` } }), ctx.env);
+  assert.equal(basic.status, 401);
+  let last; for (let i = 0; i < 31; i++) last = await bearer("w".repeat(40), { "cf-connecting-ip": "192.0.2.3" });
+  assert.equal(last.status, 429);
+  const off = await setup({ API_TOKEN: "" });
+  assert.equal((await worker.fetch(new Request("https://app.test/api/jobs", { headers: { authorization: `Bearer ${TOKEN}` } }), off.env)).status, 401);
+  const short = await setup({ API_TOKEN: "t".repeat(31), AUTH_PASSWORD: "" });
+  assert.equal((await worker.fetch(new Request("https://app.test/api/jobs", { headers: { authorization: `Bearer ${"t".repeat(31)}` } }), short.env)).status, 503);
+  // token-only deployment (no password configured) still works
+  const only = await setup({ AUTH_PASSWORD: "", API_TOKEN: TOKEN });
+  assert.equal((await worker.fetch(new Request("https://app.test/api/jobs", { headers: { authorization: `Bearer ${TOKEN}` } }), only.env)).status, 200);
+  for (const c of [ctx, off, short, only]) c.net.restore();
+});
+
+test("login is rate limited per IP and rejects cross-origin posts", async () => {
+  const ctx = await setup(); // setup already used 1 attempt for 203.0.113.7
+  for (let i = 0; i < 9; i++) assert.equal((await ctx.rawLogin("guess " + i)).status, 401);
+  const blocked = await ctx.rawLogin(PASSWORD); // correct password does not bypass the limit
+  assert.equal(blocked.status, 429); assert.equal(blocked.headers.get("retry-after"), "900"); assert.equal(blocked.headers.get("set-cookie"), null);
+  const other = await ctx.rawLogin(PASSWORD, { "cf-connecting-ip": "198.51.100.9" });
+  assert.equal(other.status, 200);
+  const cross = await ctx.rawLogin(PASSWORD, { origin: "https://evil.test", "cf-connecting-ip": "198.51.100.10" });
+  assert.equal(cross.status, 403);
   ctx.net.restore();
 });
 
@@ -107,15 +189,17 @@ test("full lifecycle: create -> upload -> analyze -> callbacks -> results -> del
   ctx.net.restore();
 });
 
-test("IDOR: another user cannot see, upload to, analyze, fetch or delete a job", async () => {
+test("ownership: a job owned by another user id is invisible and untouchable", async () => {
   const ctx = await setup();
-  const { id, key } = await readyJob(ctx, "alice");
+  const { id, key } = await readyJob(ctx);
+  assert.equal((await ctx.call("alice", "GET", `/api/jobs/${id}`)).status, 200);
+  await ctx.env.DB.prepare("UPDATE jobs SET user_id = ? WHERE id = ?").bind("f".repeat(32), id).run(); // someone else's job
   for (const [m, p] of [["GET", ""], ["POST", "/upload-url"], ["POST", "/upload-complete"], ["POST", "/analyze"], ["GET", "/results"], ["DELETE", ""]]) {
-    const res = await ctx.call("mallory", m, `/api/jobs/${id}${p}`, m === "POST" ? {} : undefined);
+    const res = await ctx.call("alice", m, `/api/jobs/${id}${p}`, m === "POST" ? {} : undefined);
     assert.equal(res.status, 404, `${m} ${p}`);
   }
   assert.ok(ctx.env.BUCKET.objects.has(key));
-  assert.equal((await ctx.call("mallory", "GET", "/api/jobs")).body.jobs.length, 0);
+  assert.equal((await ctx.call("alice", "GET", "/api/jobs")).body.jobs.length, 0);
   assert.equal((await ctx.call("alice", "GET", "/api/jobs/not-an-id")).status, 404);
   ctx.net.restore();
 });

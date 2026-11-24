@@ -1,4 +1,4 @@
-# REA VIDEO API + PWA (single origin so one Cloudflare Access app protects both).
+# REA VIDEO API + PWA (single origin; password login handled by the Worker itself).
 # No secrets here. Secrets are set with `wrangler secret put` (see docs/deployment/secrets.md).
 name = "rea-video"
 main = "src/index.js"
@@ -28,6 +28,6 @@ GITHUB_REF = "byga-integration"
 GITHUB_WORKFLOW = "analyze-r2.yml"
 MAX_UPLOAD_BYTES = "209715200"   # 200 MiB until benchmarked on a real runner
 MAX_CONCURRENT_JOBS = "2"
-# Set after creating the Access application (not secrets, but account-specific):
-# ACCESS_TEAM_DOMAIN = "<team>.cloudflareaccess.com"
-# ACCESS_AUD = "<application AUD tag>"
+# Login needs two Worker secrets (never put them here): AUTH_PASSWORD (>= 8 chars) and SESSION_SECRET (>= 32 random chars).
+# Optional: API_TOKEN (>= 32 chars) enables `Authorization: Bearer` access for scripts.
+# See docs/deployment/secrets.md.

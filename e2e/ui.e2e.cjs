@@ -1,6 +1,6 @@
 // Local end-to-end test: real PWA in headless Chromium -> real Worker code (SQLite as D1, in-memory R2)
 // -> real scripts/run_analysis.py + rea-video on a real video -> signed callback -> UI -> download -> delete.
-// Cloudflare itself (Access, R2 S3 endpoint, GitHub dispatch) is simulated; see docs/deployment/testing.md.
+// Cloudflare itself (R2 S3 endpoint, GitHub dispatch) is simulated; the password login runs for real through the UI; see docs/deployment/testing.md.
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -15,13 +15,13 @@ const must = (c, m) => { if (!c) { console.error("FAIL:", m); process.exitCode =
 process.on("uncaughtException", (e) => { console.error("UNCAUGHT", e.stack); process.exit(1); });
 (async () => {
   const { default: worker } = await import(path.join(ROOT, "worker/src/index.js"));
-  const { FakeR2, installFetch, makeAccess, makeDb } = await import(path.join(ROOT, "worker/test/helpers.js"));
-  const access = await makeAccess();
+  const { FakeR2, installFetch, makeDb } = await import(path.join(ROOT, "worker/test/helpers.js"));
+  const PASSWORD = "e2e-password-123";
   const SECRET = "e".repeat(48);
-  const env = { DB: makeDb(), BUCKET: new FakeR2(), ACCESS_TEAM_DOMAIN: access.team, ACCESS_AUD: access.aud, R2_ACCOUNT_ID: "acc", R2_BUCKET_NAME: "rea-video-storage",
+  const env = { DB: makeDb(), BUCKET: new FakeR2(), AUTH_PASSWORD: PASSWORD, SESSION_SECRET: "t".repeat(48), R2_ACCOUNT_ID: "acc", R2_BUCKET_NAME: "rea-video-storage",
     R2_ACCESS_KEY_ID: "AK", R2_SECRET_ACCESS_KEY: "SK", GITHUB_TOKEN: "t", GITHUB_REPO: "harvey-moeid/rea-video", GITHUB_REF: "byga-integration", CALLBACK_SECRET: SECRET, MAX_UPLOAD_BYTES: String(100 * 1024 * 1024) };
   const dispatches = [];
-  installFetch([["cloudflareaccess.com", async () => new Response(JSON.stringify({ keys: [access.jwk] }))],
+  installFetch([
     ["api.github.com", async (_u, init) => { dispatches.push(JSON.parse(init.body)); return new Response(null, { status: 204 }); }]]);
   const types = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".webmanifest": "application/manifest+json", ".png": "image/png" };
   env.ASSETS = { fetch: async (req) => {
@@ -30,11 +30,9 @@ process.on("uncaughtException", (e) => { console.error("UNCAUGHT", e.stack); pro
     if (!f.startsWith(path.join(ROOT, "web")) || !fs.existsSync(f)) return new Response("nf", { status: 404 });
     return new Response(fs.readFileSync(f), { headers: { "content-type": types[path.extname(f)] || "application/octet-stream" } });
   } };
-  const jwt = await access.token("e2e-user");
   const server = http.createServer(async (req, res) => {
     const chunks = []; for await (const c of req) chunks.push(c);
     const headers = new Headers(); for (const [k, v] of Object.entries(req.headers)) headers.set(k, String(v));
-    if (!req.url.startsWith("/api/internal/")) headers.set("cf-access-jwt-assertion", jwt); // Access sits in front of the app
     const r = await worker.fetch(new Request(`http://127.0.0.1:${server.address().port}${req.url}`, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : Buffer.concat(chunks) }), env);
     res.writeHead(r.status, Object.fromEntries(r.headers)); res.end(Buffer.from(await r.arrayBuffer()));
   });
@@ -70,7 +68,17 @@ process.on("uncaughtException", (e) => { console.error("UNCAUGHT", e.stack); pro
   page.on("dialog", (d) => d.accept()); page.on("requestfailed", (r) => console.log("REQFAIL", r.method(), r.url().slice(0, 80), r.failure()?.errorText));
   const errors = []; page.on("pageerror", (e) => errors.push(String(e)));
   await page.goto(base + "/");
+  await page.waitForSelector("input[type=password]");
+  must(!(await page.isVisible("nav")), "signed-out visitors see only the password form (no app navigation)");
+  must((await page.evaluate(() => fetch("/api/jobs").then((r) => r.status))) === 401, "API refuses requests without a session");
+  await page.fill("input[type=password]", "wrong password"); await page.click("button:has-text(\"Sign in\")");
+  await page.waitForSelector("text=wrong password", { timeout: 5000 });
+  must(await page.isVisible("input[type=password]"), "wrong password keeps the login form");
+  await page.fill("input[type=password]", PASSWORD); await page.click("button:has-text(\"Sign in\")");
   await page.waitForSelector("text=Videos");
+  must(await page.isVisible("nav"), "correct password opens the app");
+  await page.reload(); await page.waitForSelector("text=Videos");
+  must(true, "session survives a page reload (HttpOnly cookie)");
   must((await page.textContent(".stats")).includes("Total jobs"), "dashboard renders stats");
   must((await page.evaluate(() => fetch("/manifest.webmanifest").then((r) => r.json()))).name === "REA VIDEO", "manifest served");
 
@@ -126,6 +134,9 @@ process.on("uncaughtException", (e) => { console.error("UNCAUGHT", e.stack); pro
   await page.click(".job .btn.danger");
   await page.waitForSelector("text=No videos yet", { timeout: 15000 });
   must(env.BUCKET.objects.size === 0, "multipart job deleted completely");
+  await page.click("nav >> text=Settings"); await page.click("button:has-text(\"Log out\")");
+  await page.waitForSelector("input[type=password]");
+  must((await page.evaluate(() => fetch("/api/jobs").then((r) => r.status))) === 401, "log out ends the session");
   must(errors.length === 0, "no uncaught browser errors " + errors.join("|"));
   await browser.close(); server.close(); r2srv.close(); fs.rmSync(tmp, { recursive: true, force: true });
   console.log("UI E2E PASSED");

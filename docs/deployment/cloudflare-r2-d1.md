@@ -38,7 +38,7 @@ Job states: `UPLOADING`, `READY`, `QUEUED`, `PROCESSING`, `COMPLETED`, `FAILED`,
 ## Intended request flow
 
 1. Authenticated PWA asks the Worker to create a job.
-2. Worker derives the user identity from a verified Cloudflare Access JWT; never trust a client-supplied `user_id`.
+2. Worker derives the user identity from a verified, HMAC-signed session cookie issued after the password login; never trust a client-supplied `user_id`.
 3. Worker writes `UPLOADING` metadata and issues a short-lived upload URL for the exact R2 object key.
 4. PWA uploads directly to private R2, then confirms completion. Worker validates object existence, size and expected content type before moving to `READY`.
 5. User explicitly starts analysis. Worker dispatches a manual GitHub Actions workflow; Python/FFmpeg/ONNX processing runs on the Actions runner, not inside Workers.
@@ -61,7 +61,7 @@ Every operation must enforce job ownership server-side. Signed URLs must be shor
 
 ## Security and operational requirements
 
-- Verify Cloudflare Access JWT signature, issuer, audience and expiry on every user-facing API request.
+- Verify the session cookie signature and expiry on every user-facing API request; rate-limit login attempts per IP.
 - Keep R2 S3 credentials and GitHub dispatch credentials in Worker secrets; keep runner credentials in GitHub Actions secrets.
 - Validate upload size, media type, job ownership, object key prefix and job state.
 - Use multipart uploads for large files and abort incomplete multipart sessions.
@@ -72,7 +72,7 @@ Every operation must enforce job ownership server-side. Signed URLs must be shor
 
 ## Remaining implementation work
 
-1. Build Worker API and Access authentication.
+1. Build Worker API and password authentication.
 2. Bind Worker to `rea-video-storage` and `rea-video-db`.
 3. Build PWA upload/history/results/delete flows.
 4. Add manual GitHub Actions workflow for Python analysis and R2 transfer.

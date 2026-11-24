@@ -9,11 +9,15 @@ GitHub only registers `workflow_dispatch`-only workflows that exist on the repos
 - **B:** copy only the three workflow files into the fork's `main`.
 Until one is done, the end-to-end flow stops at "Start analysis" (dispatch fails, the job returns to READY with an error).
 
-## 1. Cloudflare Access (protects the whole app)
-1. Zero Trust > Access > Applications > Add > Self-hosted. Domain: the Worker hostname (`rea-video.<subdomain>.workers.dev` or a custom domain you own). Policy: Allow your email.
-2. Copy the application **AUD tag** and your **team domain** (`<team>.cloudflareaccess.com`).
-3. Put them in `worker/wrangler.toml` `[vars]` as `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`, or set them in the dashboard. Until both exist the API answers 503 (fail closed).
-4. Do **not** add a bypass policy for `/api/internal/*` unless you want to rely on the HMAC alone. The HMAC callback is verified by the Worker, but Access in front will block the GitHub runner unless you add a Service Auth token or a Bypass rule limited to `/api/internal/*`. Recommended: Bypass for that path only (HMAC + replay protection still apply).
+## 1. Login password (protects the whole app, no Cloudflare Access)
+The Worker shows a password form and, after a correct password, sets an `HttpOnly`, `SameSite=Strict`, `Secure` session cookie (30 days, signed with HMAC-SHA256). There is a single account that owns every job.
+1. Choose a password of at least 8 characters (longer is better, e.g. a 4-word passphrase) and set it as Worker secret `AUTH_PASSWORD`.
+2. Generate `SESSION_SECRET` (>= 32 random chars, `openssl rand -hex 32`) and set it as a Worker secret.
+3. Until both are set and long enough, `/api/login` and the API answer 503 (fail closed).
+4. Changing `AUTH_PASSWORD` or `SESSION_SECRET` signs every device out immediately.
+5. Wrong guesses are limited to 10 attempts per 15 minutes per IP address (counted in D1).
+6. Optional machine access (scripts, MCP tools): set Worker secret `API_TOKEN` (>= 32 random chars). Callers send `Authorization: Bearer <API_TOKEN>` on any `/api/*` endpoint (no login or cookie needed) and act as the same Owner account. Unset it to disable; rotate it by replacing the secret. Failed token attempts are limited to 30 per 15 minutes per IP.
+7. Do not put any Cloudflare Access policy in front of this Worker anymore; the GitHub runner reaches `/api/internal/*` directly and is authenticated by the HMAC callback.
 
 ## 2. R2 S3 credentials (two separate tokens, least privilege)
 Create R2 API tokens scoped to bucket `rea-video-storage` only:
@@ -26,6 +30,9 @@ Create R2 API tokens scoped to bucket `rea-video-storage` only:
 | `R2_ACCOUNT_ID` | account id for presigned URLs |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | presign upload/download URLs |
 | `GITHUB_TOKEN` | fine-grained PAT, only repo `harvey-moeid/rea-video`, permission **Actions: Read and write** |
+| `AUTH_PASSWORD` | the login password (>= 8 chars) |
+| `SESSION_SECRET` | signs the session cookie (>= 32 random chars) |
+| `API_TOKEN` (optional) | Bearer token for scripts/MCP (>= 32 random chars) |
 | `CALLBACK_SECRET` | >= 32 random chars (`openssl rand -hex 32`); same value as GitHub `WORKER_CALLBACK_SECRET` |
 
 ## 4. GitHub Actions secrets (repo Settings > Secrets > Actions)

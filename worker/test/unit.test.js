@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { presign, presignR2 } from "../src/sigv4.js";
-import { verifyAccessJwt, _resetJwksCache, verifyCallback, hmacHex, callbackSigningString } from "../src/auth.js";
+import { authConfigured, checkPassword, createSession, safeEqual, verifyCallback, verifySession, hmacHex, callbackSigningString } from "../src/auth.js";
 import { cleanFilename, keyInside, looksLikeVideo, validateCreate, kindForKey } from "../src/validate.js";
-import { makeAccess, makeDb, mp4Bytes } from "./helpers.js";
+import { makeDb, mp4Bytes } from "./helpers.js";
 
 test("SigV4 presign reproduces the AWS documented reference signature", async () => {
   const url = await presign({
@@ -24,20 +24,28 @@ test("R2 presign encodes keys and includes extra query params", async () => {
   await assert.rejects(() => presignR2({}, { method: "GET", key: "k" }), /not configured/);
 });
 
-test("Access JWT: valid, wrong audience, wrong issuer, expired, bad signature, unknown kid", async () => {
-  const a = await makeAccess();
-  const fetchImpl = async () => ({ ok: true, json: async () => ({ keys: [a.jwk] }) });
-  const opts = { teamDomain: a.team, aud: a.aud, fetchImpl };
-  _resetJwksCache();
-  const claims = await verifyAccessJwt(await a.token("alice"), opts);
-  assert.equal(claims.sub, "alice");
-  for (const [over, re] of [[{ aud: ["other"] }, /audience/], [{ iss: "https://evil.example.com" }, /issuer/], [{ exp: 1 }, /expired/], [{ sub: "" }, /subject/]]) {
-    await assert.rejects(async () => verifyAccessJwt(await a.token("bob", over), opts), re);
-  }
-  const other = await makeAccess();
-  await assert.rejects(async () => verifyAccessJwt(await a.token("eve", {}, other.pair.privateKey), opts), /signature/);
-  await assert.rejects(() => verifyAccessJwt("a.b.c", opts));
-  await assert.rejects(() => verifyAccessJwt("x", { ...opts, aud: undefined }), /not configured/);
+test("password + session helpers: config checks, constant-time compare, signed cookie lifecycle", async () => {
+  const env = { AUTH_PASSWORD: "hunter2hunter2", SESSION_SECRET: "k".repeat(40) };
+  assert.equal(authConfigured(env), true);
+  for (const bad of [{}, { ...env, AUTH_PASSWORD: "short" }, { ...env, SESSION_SECRET: "k".repeat(31) }, { ...env, AUTH_PASSWORD: 12345678 }]) assert.equal(authConfigured(bad), false);
+  assert.equal(await safeEqual("abc", "abc"), true); assert.equal(await safeEqual("abc", "abd"), false); assert.equal(await safeEqual("abc", "abcd"), false);
+  assert.equal(await checkPassword(env, "hunter2hunter2"), true);
+  for (const wrong of ["hunter2hunter3", "", undefined, null, 7, "x".repeat(257)]) assert.equal(await checkPassword(env, wrong), false);
+  assert.equal(await checkPassword({}, "anything"), false);
+
+  const now = 1_800_000_000;
+  const { value, maxAge } = await createSession(env, now);
+  assert.equal(maxAge, 30 * 24 * 3600);
+  const cookie = `a=b; rea_session=${value}; c=d`;
+  assert.ok(await verifySession(env, cookie, now + 10));
+  assert.equal((await verifySession(env, cookie, now + 10))?.userId.length, 32);
+  assert.equal(await verifySession(env, cookie, now + maxAge + 1), null, "expired");
+  assert.equal(await verifySession(env, cookie, now - 3600), null, "issued in the future");
+  assert.equal(await verifySession({ ...env, AUTH_PASSWORD: "another-password" }, cookie, now + 10), null, "password change invalidates");
+  assert.equal(await verifySession({ ...env, SESSION_SECRET: "z".repeat(40) }, cookie, now + 10), null, "secret change invalidates");
+  assert.equal(await verifySession({}, cookie, now + 10), null, "unconfigured");
+  assert.equal(await verifySession(env, "rea_session=garbage", now), null);
+  assert.equal(await verifySession(env, undefined, now), null);
 });
 
 test("callback HMAC: valid, tampered body, stale, replay, short secret", async () => {

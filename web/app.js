@@ -30,11 +30,39 @@ async function api(method, path, body, headers = {}) {
   try {
     res = await fetch(path, { method, credentials: "same-origin", headers: { ...(body !== undefined ? { "content-type": "application/json" } : {}), ...headers }, body: body !== undefined ? JSON.stringify(body) : undefined });
   } catch {
-    throw new Error("Cannot reach the server. Check your connection, or reload to sign in again.");
+    throw new Error("Cannot reach the server. Check your connection and try again.");
   }
   const data = await res.json().catch(() => null);
-  if (!res.ok) { const e = new Error(data?.error || `Request failed (${res.status})`); e.status = res.status; e.data = data; throw e; }
+  if (!res.ok) {
+    // expired or missing session anywhere in the app -> back to the password screen
+    if (res.status === 401 && path !== "/api/login") showLogin(serverStatus ? "Session expired. Please sign in again." : "");
+    const e = new Error(data?.error || `Request failed (${res.status})`); e.status = res.status; e.data = data; throw e;
+  }
   return data;
+}
+
+// ---------- login ----------
+function showLogin(message) {
+  clearTimeout(pollTimer);
+  document.body.classList.add("anon");
+  const input = h("input", { id: "pw", type: "password", name: "password", autocomplete: "current-password", required: true, maxlength: 256 });
+  const msg = h("p", { class: "small err", role: "alert" }, message || "");
+  const btn = h("button", { class: "btn", type: "submit" }, "Sign in");
+  const form = h("form", { class: "card login" }, h("h1", {}, "Sign in"), h("label", { class: "small muted", for: "pw" }, "Password"), input, msg, btn);
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    btn.disabled = true; msg.textContent = "";
+    try {
+      await api("POST", "/api/login", { password: input.value });
+      document.body.classList.remove("anon");
+      serverStatus = null;
+      route();
+    } catch (err) {
+      msg.textContent = err.message; btn.disabled = false; input.select();
+    }
+  });
+  mount(form);
+  input.focus();
 }
 const mount = (...kids) => $app.replaceChildren(...kids.flat(Infinity).filter((k) => k !== null && k !== undefined && k !== false));
 const badge = (s) => h("span", { class: `badge ${s}` }, s);
@@ -225,11 +253,12 @@ async function viewSettings() {
   mount(
     h("h1", {}, "Settings"),
     h("div", { class: "card" }, h("dl", {}, [
-      ["Account", me.email || "signed in"], ["Backend", yes(st.ok)], ["Database (D1)", yes(st.database)], ["Storage (R2)", yes(st.storage)],
+      ["Account", "Owner (password login)"], ["Backend", yes(st.ok)], ["Database (D1)", yes(st.database)], ["Storage (R2)", yes(st.storage)],
       ["Direct uploads configured", yes(st.uploads_configured)], ["Analysis dispatch configured", yes(st.analysis_configured)],
       ["Max upload", fmtBytes(st.max_upload_bytes)], ["App version", st.version],
     ].flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)]))),
-    h("p", { class: "small muted" }, "Videos and results are kept until you delete them. No automatic expiry is configured."));
+    h("p", { class: "small muted" }, "Videos and results are kept until you delete them. No automatic expiry is configured."),
+    h("p", {}, h("button", { class: "btn ghost", onclick: async () => { try { await api("POST", "/api/logout", {}); } catch {} serverStatus = null; showLogin(); } }, "Log out")));
 }
 
 // ---------- router ----------
@@ -246,6 +275,7 @@ async function route() {
     else if (hash === "#/settings") await viewSettings();
     else await viewHome();
   } catch (e) {
+    if (e.status === 401) return; // api() already switched to the login screen
     mount(h("p", { class: "err" }, e.message), h("button", { class: "btn", onclick: () => route() }, "Retry"));
   }
 }

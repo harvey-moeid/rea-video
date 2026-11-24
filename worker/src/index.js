@@ -1,6 +1,6 @@
 // REA VIDEO API Worker. Heavy processing never runs here: uploads go straight to R2 via presigned
 // URLs, analysis runs in GitHub Actions, results come back through an HMAC-authenticated callback.
-import { verifyAccessJwt, userIdFromClaims, verifyCallback } from "./auth.js";
+import { SESSION_COOKIE, apiTokenConfigured, authConfigured, checkPassword, createSession, verifyApiToken, verifyCallback, verifySession } from "./auth.js";
 import { presignR2, sha256Hex } from "./sigv4.js";
 import {
   DEFAULT_MAX_UPLOAD_BYTES, JOB_ID_RE, MAX_PARTS_PER_REQUEST, PART_SIZE, SINGLE_PUT_MAX,
@@ -306,15 +306,35 @@ async function internal(env, request, url, id, action) {
 }
 
 // ---------- router ----------
+// Session cookie (browser) or Bearer API token (scripts). Returns { auth } or { response } to send back.
 async function authenticate(env, request) {
-  const token = request.headers.get("cf-access-jwt-assertion");
-  if (!token) return null;
-  try {
-    const claims = await verifyAccessJwt(token, { teamDomain: env.ACCESS_TEAM_DOMAIN, aud: env.ACCESS_AUD });
-    return { userId: await userIdFromClaims(claims), email: claims.email || null };
-  } catch {
-    return null;
+  const session = await verifySession(env, request.headers.get("cookie"));
+  if (session) return { auth: session };
+  const tok = await verifyApiToken(env, request.headers.get("authorization"));
+  if (tok.state === "ok") return { auth: { userId: tok.userId } };
+  if (tok.state === "bad") {
+    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    if (!(await rateLimit(env.DB, `apitoken:${ip}`, 30, 900))) return { response: json({ error: "too many failed attempts" }, 429, { "retry-after": "900" }) };
   }
+  return { response: err(401, "unauthorized") };
+}
+
+function sessionCookie(url, value, maxAge) {
+  // Secure only over https so local http testing still works; production Workers are always https.
+  return `${SESSION_COOKIE}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Strict${url.protocol === "https:" ? "; Secure" : ""}`;
+}
+
+const LOGIN_LIMIT = 10, LOGIN_WINDOW_SEC = 900;
+async function login(env, request, url) {
+  if (!authConfigured(env)) return err(503, "authentication is not configured");
+  const ip = request.headers.get("cf-connecting-ip") || "unknown";
+  if (!(await rateLimit(env.DB, `login:${ip}`, LOGIN_LIMIT, LOGIN_WINDOW_SEC))) {
+    return json({ error: "too many login attempts; try again in a few minutes" }, 429, { "retry-after": String(LOGIN_WINDOW_SEC) });
+  }
+  const { value } = await readJson(request);
+  if (!(await checkPassword(env, value.password))) return err(401, "wrong password");
+  const session = await createSession(env);
+  return json({ ok: true }, 200, { "set-cookie": sessionCookie(url, session.value, session.maxAge) });
 }
 
 export async function handleApi(request, env) {
@@ -327,18 +347,21 @@ export async function handleApi(request, env) {
   const mi = path.match(/^\/api\/internal\/jobs\/([^/]+)\/(started|completed|failed)$/);
   if (mi && method === "POST") return internal(env, request, url, mi[1], mi[2]);
 
-  if (!env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) return err(503, "authentication is not configured");
-  const auth = await authenticate(env, request);
-  if (!auth) return err(401, "unauthorized");
-  const { userId } = auth;
-
   if (method !== "GET" && method !== "HEAD") {
-    // CSRF defence in depth: browser requests with an Origin must be same-origin
+    // CSRF defence in depth (on top of SameSite=Strict): browser requests with an Origin must be same-origin
     const origin = request.headers.get("origin");
     if (origin && origin !== url.origin) return err(403, "cross-origin request rejected");
   }
 
-  if (path === "/api/me" && method === "GET") return json({ email: auth.email, user_id: userId.slice(0, 8) });
+  if (path === "/api/login" && method === "POST") return login(env, request, url);
+  if (path === "/api/logout" && method === "POST") return json({ ok: true }, 200, { "set-cookie": sessionCookie(url, "", 0) });
+
+  if (!authConfigured(env) && !apiTokenConfigured(env)) return err(503, "authentication is not configured");
+  const result = await authenticate(env, request);
+  if (result.response) return result.response;
+  const { userId } = result.auth;
+
+  if (path === "/api/me" && method === "GET") return json({ user: "owner", user_id: userId.slice(0, 8) });
   if (path === "/api/status" && method === "GET") {
     let db = false, storage = false;
     try { await env.DB.prepare("SELECT 1").first(); db = true; } catch {}
