@@ -3,6 +3,12 @@
 Nothing in this repository contains a secret. Values below must be created by the account owner.
 Names are fixed; do not paste values into chat, issues or commits.
 
+## 0. Prerequisite: make the dispatch-only workflows registrable (BLOCKER, needs owner decision)
+GitHub only registers `workflow_dispatch`-only workflows that exist on the repository's **default branch**. Verified on 2026-11-25: `ci.yml` (has a push trigger) is listed, while `analyze-r2.yml`, `release.yml` and `deploy-cloudflare.yml` return 404 from the runs/dispatch API. The Worker's `analyze` call therefore cannot start a run yet. Choose one (both leave the contents of `main` unchanged only in option A):
+- **A (recommended):** Settings > Branches > change the fork's default branch to `byga-integration`. `main` is not modified.
+- **B:** copy only the three workflow files into the fork's `main`.
+Until one is done, the end-to-end flow stops at "Start analysis" (dispatch fails, the job returns to READY with an error).
+
 ## 1. Cloudflare Access (protects the whole app)
 1. Zero Trust > Access > Applications > Add > Self-hosted. Domain: the Worker hostname (`rea-video.<subdomain>.workers.dev` or a custom domain you own). Policy: Allow your email.
 2. Copy the application **AUD tag** and your **team domain** (`<team>.cloudflareaccess.com`).
