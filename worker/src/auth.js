@@ -1,68 +1,89 @@
-// Cloudflare Access JWT verification (RS256) + HMAC verification for GitHub Actions callbacks.
+// Password login (HMAC-signed session cookie) + HMAC verification for GitHub Actions callbacks.
 import { sha256Hex } from "./sigv4.js";
 
 const enc = new TextEncoder();
-const b64urlToBytes = (s) => {
+
+const toB64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const fromB64url = (s) => {
   s = s.replace(/-/g, "+").replace(/_/g, "/");
   while (s.length % 4) s += "=";
-  const bin = atob(s);
-  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 };
-const b64urlToJson = (s) => JSON.parse(new TextDecoder().decode(b64urlToBytes(s)));
-
-let jwksCache = { at: 0, keys: null, domain: null };
-
-export function _resetJwksCache() {
-  jwksCache = { at: 0, keys: null, domain: null };
-}
-
-async function loadJwks(teamDomain, fetchImpl, force) {
-  const fresh = jwksCache.keys && jwksCache.domain === teamDomain && Date.now() - jwksCache.at < 3600_000;
-  if (fresh && !force) return jwksCache.keys;
-  const res = await fetchImpl(`https://${teamDomain}/cdn-cgi/access/certs`);
-  if (!res.ok) throw new Error("jwks fetch failed");
-  const { keys } = await res.json();
-  jwksCache = { at: Date.now(), keys, domain: teamDomain };
-  return keys;
-}
-
-/** Returns verified claims or throws. Fails closed. */
-export async function verifyAccessJwt(token, { teamDomain, aud, fetchImpl = fetch, nowSec = Math.floor(Date.now() / 1000) }) {
-  if (!teamDomain || !aud) throw new Error("access not configured");
-  const parts = String(token || "").split(".");
-  if (parts.length !== 3) throw new Error("malformed token");
-  const header = b64urlToJson(parts[0]);
-  if (header.alg !== "RS256" || !header.kid) throw new Error("unsupported alg");
-  let keys = await loadJwks(teamDomain, fetchImpl, false);
-  let jwk = keys.find((k) => k.kid === header.kid);
-  if (!jwk) {
-    keys = await loadJwks(teamDomain, fetchImpl, true);
-    jwk = keys.find((k) => k.kid === header.kid);
-  }
-  if (!jwk) throw new Error("unknown key");
-  const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
-  const ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, b64urlToBytes(parts[2]), enc.encode(`${parts[0]}.${parts[1]}`));
-  if (!ok) throw new Error("bad signature");
-  const claims = b64urlToJson(parts[1]);
-  if (claims.iss !== `https://${teamDomain}`) throw new Error("bad issuer");
-  const audOk = Array.isArray(claims.aud) ? claims.aud.includes(aud) : claims.aud === aud;
-  if (!audOk) throw new Error("bad audience");
-  if (typeof claims.exp !== "number" || claims.exp <= nowSec) throw new Error("expired");
-  if (typeof claims.nbf === "number" && claims.nbf > nowSec + 30) throw new Error("not yet valid");
-  if (!claims.sub) throw new Error("no subject");
-  return claims;
-}
-
-/** Opaque, stable, key-safe user id derived from the verified Access subject. */
-export async function userIdFromClaims(claims) {
-  return (await sha256Hex(`rea-video:user:${claims.sub}`)).slice(0, 32);
-}
-
 const toHex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+export const SESSION_COOKIE = "rea_session";
+export const SESSION_TTL_SEC = 30 * 24 * 3600;
+export const MIN_PASSWORD_LENGTH = 8;
+export const MIN_SESSION_SECRET_LENGTH = 32;
 
 export async function hmacHex(secret, message) {
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return toHex(await crypto.subtle.sign("HMAC", key, enc.encode(message)));
+}
+
+/** Constant-time string comparison: HMAC both values under a throwaway random key, then compare the digests. */
+export async function safeEqual(a, b) {
+  const rk = crypto.getRandomValues(new Uint8Array(32));
+  const k = await crypto.subtle.importKey("raw", rk, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const [x, y] = await Promise.all([crypto.subtle.sign("HMAC", k, enc.encode(String(a))), crypto.subtle.sign("HMAC", k, enc.encode(String(b)))]);
+  return toHex(x) === toHex(y);
+}
+
+/** Login is only enabled when both secrets are set and long enough (fails closed otherwise). */
+export function authConfigured(env) {
+  return typeof env.AUTH_PASSWORD === "string" && env.AUTH_PASSWORD.length >= MIN_PASSWORD_LENGTH
+    && typeof env.SESSION_SECRET === "string" && env.SESSION_SECRET.length >= MIN_SESSION_SECRET_LENGTH;
+}
+
+export async function checkPassword(env, candidate) {
+  if (!authConfigured(env) || typeof candidate !== "string" || candidate.length === 0 || candidate.length > 256) {
+    // still burn comparable time so a wrong-shape request is not distinguishable by latency
+    await safeEqual("x", "y");
+    return false;
+  }
+  return safeEqual(env.AUTH_PASSWORD, candidate);
+}
+
+// The signing key depends on BOTH secrets, so changing the password (or the session secret) logs everyone out.
+// It is derived rather than stored in the cookie, so the cookie never carries anything password-related.
+const sessionKey = (env) => hmacHex(env.SESSION_SECRET, `rea-video:session-key:${env.AUTH_PASSWORD}`);
+
+export async function createSession(env, nowSec = Math.floor(Date.now() / 1000)) {
+  const payload = toB64url(enc.encode(JSON.stringify({ sub: "owner", iat: nowSec, exp: nowSec + SESSION_TTL_SEC })));
+  const sig = await hmacHex(await sessionKey(env), payload);
+  return { value: `${payload}.${sig}`, maxAge: SESSION_TTL_SEC };
+}
+
+function readCookie(header, name) {
+  for (const part of String(header || "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return null;
+}
+
+/** Returns { userId } for a valid, unexpired session cookie, otherwise null. Never throws. */
+export async function verifySession(env, cookieHeader, nowSec = Math.floor(Date.now() / 1000)) {
+  try {
+    if (!authConfigured(env)) return null;
+    const raw = readCookie(cookieHeader, SESSION_COOKIE);
+    if (!raw) return null;
+    const parts = raw.split(".");
+    if (parts.length !== 2 || !/^[0-9a-f]{64}$/.test(parts[1])) return null;
+    const expected = await hmacHex(await sessionKey(env), parts[0]);
+    if (!(await safeEqual(expected, parts[1]))) return null;
+    const claims = JSON.parse(new TextDecoder().decode(fromB64url(parts[0])));
+    if (claims.sub !== "owner" || typeof claims.exp !== "number" || claims.exp <= nowSec) return null;
+    if (typeof claims.iat === "number" && claims.iat > nowSec + 60) return null;
+    return { userId: await ownerUserId() };
+  } catch {
+    return null;
+  }
+}
+
+/** Opaque, stable, key-safe id of the single account that owns every job. */
+export async function ownerUserId() {
+  return (await sha256Hex("rea-video:user:owner")).slice(0, 32);
 }
 
 /** Canonical string the GitHub runner signs: ts.nonce.METHOD.path.sha256(body) */
@@ -84,11 +105,7 @@ export async function verifyCallback({ secret, headers, method, path, body, db, 
   }
   if (Math.abs(nowMs / 1000 - Number(ts)) > 300) throw new Error("stale timestamp");
   const expected = await hmacHex(secret, await callbackSigningString(ts, nonce, method, path, body));
-  // constant-time compare via HMAC of both values under a random key
-  const rk = crypto.getRandomValues(new Uint8Array(32));
-  const k = await crypto.subtle.importKey("raw", rk, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const [a, b] = await Promise.all([crypto.subtle.sign("HMAC", k, enc.encode(expected)), crypto.subtle.sign("HMAC", k, enc.encode(sig))]);
-  if (toHex(a) !== toHex(b)) throw new Error("bad signature");
+  if (!(await safeEqual(expected, sig))) throw new Error("bad signature");
   await db.prepare("DELETE FROM callback_nonces WHERE created_at < ?").bind(Math.floor(nowMs / 1000) - 900).run();
   try {
     await db.prepare("INSERT INTO callback_nonces (nonce, created_at) VALUES (?, ?)").bind(nonce, Math.floor(nowMs / 1000)).run();

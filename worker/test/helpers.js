@@ -1,7 +1,6 @@
 // Test doubles: real SQLite (node:sqlite) behind a D1-shaped API, and an in-memory R2.
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
-import { webcrypto as crypto } from "node:crypto";
 
 const here = new URL("../schema/", import.meta.url);
 
@@ -61,20 +60,6 @@ export class FakeR2 {
 
 export function mp4Bytes(n = 2048) {
   const b = new Uint8Array(n); b.set([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]); return b; // "....ftypisom"
-}
-
-const b64u = (buf) => Buffer.from(buf).toString("base64url");
-export async function makeAccess({ team = "rea.cloudflareaccess.com", aud = "aud-123" } = {}) {
-  const pair = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"]);
-  const jwk = { ...(await crypto.subtle.exportKey("jwk", pair.publicKey)), kid: "k1", alg: "RS256", use: "sig" };
-  async function token(sub, over = {}, signWith = pair.privateKey) {
-    const header = b64u(JSON.stringify({ alg: "RS256", kid: "k1", typ: "JWT" }));
-    const now = Math.floor(Date.now() / 1000);
-    const claims = b64u(JSON.stringify({ iss: `https://${team}`, aud: [aud], sub, email: `${sub}@example.com`, iat: now, exp: now + 600, ...over }));
-    const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", signWith, new TextEncoder().encode(`${header}.${claims}`));
-    return `${header}.${claims}.${b64u(sig)}`;
-  }
-  return { team, aud, jwk, token, pair };
 }
 
 export function installFetch(handlers) {
