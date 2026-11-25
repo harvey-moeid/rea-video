@@ -171,6 +171,148 @@ function cancelUpload(jobId) {
   uploads.delete(jobId);
 }
 
+// ---------- results: "Download all (ZIP)" + inline report ----------
+// Everything here runs in the browser only; the Worker is unchanged. Both features fetch the existing
+// presigned R2 links directly, so the R2 bucket's CORS policy must allow GET from this app's origin
+// (see docs/results-zip-and-report.md).
+const ZIP_WARN_BYTES = 500 * 1024 ** 2; // ask before building a ZIP bigger than this (heavy on phones)
+const ZIP_MAX_BYTES = 2 * 1024 ** 3;    // hard stop: stay far from ZIP32 and browser Blob limits
+const REPORT_RE = /(^|\/)report\.html$/i;
+
+// Minimal "store" (no compression) ZIP writer. Result files are mostly JPEG/MP4/JSON/HTML, so deflate would
+// gain little, and skipping it keeps this dependency-free (the app has no bundler).
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+// entries: [{ path, blob, crc }] -> Blob. Parts are referenced, not copied, so memory stays near 1x.
+function buildZip(entries) {
+  const enc = new TextEncoder();
+  const d = new Date();
+  const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  const dosDate = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  const parts = [], central = [];
+  let offset = 0;
+  for (const e of entries) {
+    const name = enc.encode(e.path);
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); // 0x0800 = UTF-8 names
+    lh.setUint16(8, 0, true); lh.setUint16(10, dosTime, true); lh.setUint16(12, dosDate, true);
+    lh.setUint32(14, e.crc, true); lh.setUint32(18, e.blob.size, true); lh.setUint32(22, e.blob.size, true);
+    lh.setUint16(26, name.length, true); lh.setUint16(28, 0, true);
+    parts.push(lh.buffer, name, e.blob);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true);
+    ch.setUint16(10, 0, true); ch.setUint16(12, dosTime, true); ch.setUint16(14, dosDate, true);
+    ch.setUint32(16, e.crc, true); ch.setUint32(20, e.blob.size, true); ch.setUint32(24, e.blob.size, true);
+    ch.setUint16(28, name.length, true); ch.setUint32(42, offset, true);
+    central.push(ch.buffer, name);
+    offset += 30 + name.length + e.blob.size;
+  }
+  const cdSize = central.reduce((a, b) => a + (b.byteLength ?? b.length), 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, entries.length, true); end.setUint16(10, entries.length, true);
+  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end.buffer], { type: "application/zip" });
+}
+// Safe, unique path inside the ZIP (no "..", no leading slash; duplicates get a numeric suffix).
+function zipPath(key, used) {
+  let p = String(key).split("/").filter((s) => s && s !== "." && s !== "..").join("/") || "file";
+  if (used.has(p)) { const i = p.lastIndexOf("."); const [stem, ext] = i > 0 ? [p.slice(0, i), p.slice(i)] : [p, ""]; let n = 2; while (used.has(`${stem}-${n}${ext}`)) n++; p = `${stem}-${n}${ext}`; }
+  used.add(p);
+  return p;
+}
+async function fetchBlob(url) {
+  const res = await fetch(url, { credentials: "omit" }); // presigned URL: never send app cookies to R2
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.blob();
+}
+async function downloadAllZip(jobId, jobName, btn) {
+  const label = btn.textContent;
+  btn.disabled = true;
+  try {
+    btn.textContent = "Preparing…";
+    // fresh results call: presigned links expire after 5 minutes, so never reuse the ones from page load
+    const { files } = await api("GET", `/api/jobs/${jobId}/results`);
+    if (!files.length) return toast("No output files to download.");
+    const total = files.reduce((a, f) => a + (f.size || 0), 0);
+    if (total > ZIP_MAX_BYTES) return toast(`Outputs are ${fmtBytes(total)}, too large to zip in the browser (limit ${fmtBytes(ZIP_MAX_BYTES)}). Download files individually.`);
+    if (total > ZIP_WARN_BYTES && !confirm(`The ZIP will be about ${fmtBytes(total)} and is built in memory. This can be slow or fail on a phone. Continue?`)) return;
+    const used = new Set(), entries = new Array(files.length);
+    let next = 0, done = 0, failure = null;
+    const worker = async () => {
+      while (!failure && next < files.length) {
+        const i = next++, f = files[i];
+        try {
+          const blob = await withRetry(() => fetchBlob(f.url));
+          entries[i] = { path: zipPath(f.key || f.name, used), blob, crc: crc32(new Uint8Array(await blob.arrayBuffer())) };
+          btn.textContent = `Zipping ${++done}/${files.length}…`;
+        } catch (e) { failure = failure || e; }
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    if (failure) {
+      throw failure instanceof TypeError
+        ? new Error("Could not fetch files from storage. The R2 bucket's CORS rule must allow GET from this site.")
+        : failure;
+    }
+    btn.textContent = "Building ZIP…";
+    const zip = buildZip(entries);
+    const a = h("a", { href: URL.createObjectURL(zip), download: `${jobName.replace(/\.[^.]+$/, "").replace(/[^\w.-]+/g, "_") || "results"}-results.zip` });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
+    toast(`ZIP ready (${fmtBytes(zip.size)}).`);
+  } catch (e) {
+    toast(`ZIP failed: ${e.message}`);
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
+// Resolve a relative reference found in report.html to the output-file key it points at.
+function resolveKey(baseDir, ref) {
+  let r; try { r = decodeURIComponent(ref); } catch { r = ref; }
+  const out = [];
+  for (const seg of (baseDir + r).split("/")) { if (seg === "..") out.pop(); else if (seg && seg !== ".") out.push(seg); }
+  return out.join("/");
+}
+// Show report.html inside the detail page. It is fetched as text (a plain <iframe src> would trigger the
+// "attachment" download header on the presigned URL), relative frame/file references are rewritten to fresh
+// presigned URLs, and it renders in a sandboxed iframe with an opaque origin: scripts may run, but they
+// cannot touch the app's cookies or API.
+async function loadReport(files, rf, box) {
+  try {
+    const res = await fetch(rf.url, { credentials: "omit" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const doc = new DOMParser().parseFromString(await res.text(), "text/html");
+    const base = rf.key.includes("/") ? rf.key.slice(0, rf.key.lastIndexOf("/") + 1) : "";
+    const byKey = new Map(files.map((f) => [f.key, f]));
+    for (const el of doc.querySelectorAll("[src],[href],[poster]")) {
+      for (const attr of ["src", "href", "poster"]) {
+        const v = el.getAttribute(attr);
+        if (!v || /^([a-z][a-z0-9+.-]*:|#|\/)/i.test(v)) continue; // absolute, data:, anchor, root-relative: leave alone
+        const f = byKey.get(resolveKey(base, v.split(/[?#]/)[0]));
+        if (!f) continue;
+        el.setAttribute(attr, f.url);
+        if (el.tagName === "A") { el.setAttribute("target", "_blank"); el.setAttribute("rel", "noopener"); }
+      }
+    }
+    const frame = h("iframe", { class: "report-frame", title: "Report", sandbox: "allow-scripts allow-popups allow-popups-to-escape-sandbox", referrerpolicy: "no-referrer" });
+    frame.srcdoc = "<!doctype html>" + doc.documentElement.outerHTML;
+    box.replaceChildren(
+      frame,
+      frame.requestFullscreen ? h("p", {}, h("button", { class: "btn ghost", onclick: () => frame.requestFullscreen().catch(() => toast("Fullscreen is not available here.")) }, "Fullscreen")) : null);
+  } catch (e) {
+    box.replaceChildren(h("p", { class: "small err" }, `Could not show the report here (${e instanceof TypeError ? "storage CORS must allow GET from this site" : e.message}). It is still available in Outputs below.`));
+  }
+}
+
 // ---------- views ----------
 function uploadCard(jobId, u) {
   return h("div", { class: "card", "data-up": jobId },
@@ -231,6 +373,9 @@ async function viewJob(id) {
   const { job } = await api("GET", `/api/jobs/${id}`);
   let files = null;
   if (job.status === "COMPLETED") { try { files = (await api("GET", `/api/jobs/${id}/results`)).files; } catch (e) { toast(e.message); } }
+  // report.html (shortest key wins if several) is shown inline; other files stay downloadable
+  const reportFile = files ? files.filter((f) => REPORT_RE.test(f.key)).sort((a, b) => a.key.length - b.key.length)[0] : null;
+  const reportBox = reportFile ? h("div", { class: "card report" }, h("p", { class: "small muted" }, "Loading report…")) : null;
   const info = [["Status", badge(job.status)], ["File", job.filename], ["Size", fmtBytes(job.size)], ["Language", job.language], ["Created", fmtDate(job.created_at)], ["Started", fmtDate(job.started_at)], ["Finished", fmtDate(job.completed_at)]];
   if (job.summary) info.push(["Verdict", job.summary.verdict ?? "—"], ["Shots", job.summary.shots ?? "—"], ["Confidence", job.summary.confidence ?? "—"]);
   mount(
@@ -242,8 +387,10 @@ async function viewJob(id) {
       ["READY", "FAILED"].includes(job.status) && job.size ? h("button", { class: "btn", onclick: async () => { try { await api("POST", `/api/jobs/${id}/analyze`); toast("Analysis queued."); } catch (e) { toast(e.message); } route(); } }, job.status === "FAILED" ? "Retry analysis" : "Start analysis") : null,
       h("button", { class: "btn danger", disabled: ["QUEUED", "PROCESSING"].includes(job.status), onclick: async () => { await removeJob(id, job.filename); if (!document.querySelector(".badge.DELETING")) location.hash = "#/"; } }, "Delete video and results")),
     ["QUEUED", "PROCESSING"].includes(job.status) ? h("p", { class: "muted" }, "Analysis is running on GitHub Actions. This page refreshes automatically.") : null,
-    files ? h("div", {}, h("h2", {}, "Outputs"), h("p", { class: "small muted" }, "Download links expire after 5 minutes; reload to get fresh ones."),
+    reportBox ? [h("h2", {}, "Report"), reportBox] : null,
+    files ? h("div", {}, h("div", { class: "row" }, h("h2", {}, "Outputs"), files.length ? h("button", { class: "btn", onclick: (e) => downloadAllZip(id, job.filename, e.currentTarget) }, "Download all (ZIP)") : null), h("p", { class: "small muted" }, "Download links expire after 5 minutes; reload to get fresh ones."),
       files.map((f) => h("div", { class: "file" }, h("a", { href: f.url, download: f.name, rel: "noopener" }, f.key), h("span", { class: "small muted" }, fmtBytes(f.size))))) : null);
+  if (reportFile) loadReport(files, reportFile, reportBox);
   if (["QUEUED", "PROCESSING", "DELETING"].includes(job.status)) schedulePoll(5000);
 }
 

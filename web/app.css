@@ -38,3 +38,5 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0}dt{color:va
 .login input{width:100%;font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:12px 14px;min-height:44px}
 .login input:focus{outline:2px solid var(--accent);outline-offset:1px}
 .login p{margin:0;min-height:1.2em}
+.report{padding:8px}
+.report-frame{display:block;width:100%;height:70vh;min-height:420px;border:0;border-radius:10px;background:#fff}
