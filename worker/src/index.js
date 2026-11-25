@@ -307,6 +307,22 @@ async function deleteJob(env, userId, job) {
 }
 
 // ---------- internal callbacks (GitHub Actions -> Worker) ----------
+// Rows per multi-row INSERT: 4 binds each, so 20 rows = 80 bound parameters (D1 allows 100 per statement).
+const INSERT_CHUNK = 20;
+
+// One paged R2 list instead of one head() per reported object: a run can report hundreds of files and the
+// per-object round trips exceeded the runner's callback timeout and the Worker subrequest budget.
+async function listStored(env, prefix) {
+  const stored = new Map();
+  let cursor;
+  do {
+    const page = await env.BUCKET.list({ prefix, cursor, limit: 1000 });
+    for (const o of page.objects) stored.set(o.key, o.size);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return stored;
+}
+
 async function internal(env, request, url, id, action) {
   const raw = await request.clone().text();
   try {
@@ -334,16 +350,25 @@ async function internal(env, request, url, id, action) {
   const objs = Array.isArray(value.objects) ? value.objects : [];
   if (objs.length < 1 || objs.length > 5000) return err(400, "objects must contain 1..5000 entries");
   const rp = job.result_prefix + "/";
-  const verified = [];
   for (const o of objs) {
     if (!keyInside(o?.key, rp)) return err(400, "object key outside result prefix");
-    const head = await env.BUCKET.head(o.key);
-    if (!head) return err(422, "reported object is missing from storage");
-    verified.push({ key: o.key, size: head.size });
+  }
+  const stored = await listStored(env, rp);
+  const seen = new Set();
+  const verified = [];
+  for (const o of objs) {
+    if (seen.has(o.key)) continue;
+    seen.add(o.key);
+    const size = stored.get(o.key);
+    if (size === undefined) return err(422, "reported object is missing from storage");
+    verified.push({ key: o.key, size });
   }
   if (!verified.some((o) => /\/report\.(html|md)$|\/breakdown\.json$/.test(o.key))) return err(422, "no report or breakdown among outputs");
-  const stmts = verified.map((o) => env.DB.prepare("INSERT OR IGNORE INTO job_objects (job_id, object_key, object_kind, size_bytes) VALUES (?, ?, ?, ?)").bind(id, o.key, kindForKey(o.key), o.size));
-  await env.DB.batch(stmts);
+  for (let i = 0; i < verified.length; i += INSERT_CHUNK) {
+    const part = verified.slice(i, i + INSERT_CHUNK);
+    const sql = "INSERT OR IGNORE INTO job_objects (job_id, object_key, object_kind, size_bytes) VALUES " + part.map(() => "(?, ?, ?, ?)").join(", ");
+    await env.DB.prepare(sql).bind(...part.flatMap((o) => [id, o.key, kindForKey(o.key), o.size])).run();
+  }
   const summary = value.summary && typeof value.summary === "object" ? JSON.stringify(value.summary).slice(0, 4000) : null;
   const ok = await transition(env, id, ["QUEUED", "PROCESSING"], "COMPLETED", ", completed_at = ?, error_message = NULL, summary_json = ?, workflow_run_id = COALESCE(?, workflow_run_id)", [nowIso(), summary, runId]);
   return ok ? json({ ok: true, objects: verified.length }) : err(409, "job state changed");
