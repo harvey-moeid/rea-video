@@ -36,6 +36,16 @@ const maxBytes = (env) => Number(env.MAX_UPLOAD_BYTES) || DEFAULT_MAX_UPLOAD_BYT
 const maxConcurrent = (env) => Number(env.MAX_CONCURRENT_JOBS) || 2;
 const nowIso = () => new Date().toISOString();
 
+// ---------- GitHub Actions helpers (cancel) ----------
+const CANCEL_MESSAGE = "Analysis cancelled by user";
+// After a cancel the old runner may still send a late callback; block an immediate retry so it can't hit the new run.
+const CANCEL_RETRY_GRACE_MS = 30_000;
+const GH_ACTIVE_RUN = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
+const gh = (env, path, init = {}) => fetch(`https://api.github.com/repos/${env.GITHUB_REPO}${path}`, {
+  ...init,
+  headers: { authorization: `Bearer ${env.GITHUB_TOKEN}`, accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "user-agent": "rea-video-worker", ...init.headers },
+});
+
 // ---------- rate limiting & idempotency (D1) ----------
 async function rateLimit(db, bucket, limit, windowSec) {
   const win = Math.floor(Date.now() / 1000 / windowSec) * windowSec;
@@ -178,6 +188,9 @@ async function failUpload(env, job, message) {
 async function analyze(env, userId, job) {
   if (!["READY", "FAILED"].includes(job.status)) return err(409, `job is ${job.status}`);
   if (job.status === "FAILED" && !job.input_key) return err(409, "nothing to analyze");
+  if (job.status === "FAILED" && job.error_message === CANCEL_MESSAGE && Date.now() - Date.parse(job.updated_at) < CANCEL_RETRY_GRACE_MS) {
+    return err(409, "cancellation in progress; try again in a few seconds");
+  }
   if (!(await env.BUCKET.head(job.input_key))) return err(409, "source video is missing from storage");
   if (!(await rateLimit(env.DB, `analyze:${userId}`, 20, 3600))) return err(429, "rate limit exceeded");
   const active = await env.DB.prepare("SELECT COUNT(*) AS n FROM jobs WHERE user_id = ? AND status IN ('QUEUED','PROCESSING')").bind(userId).first();
@@ -202,6 +215,38 @@ async function analyze(env, userId, job) {
     return err(502, "could not start the analysis workflow; try again");
   }
   return json({ job: publicJob(await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(job.id).first()) }, 202);
+}
+
+// Stop the GitHub Actions run of a job. The run id is only known once the runner reported "started", so a job
+// that is still QUEUED is found by its run-name ("Analyze <job id>", see analyze-r2.yml).
+async function stopRunner(env, job) {
+  let ids = [];
+  if (/^\d{1,20}$/.test(job.workflow_run_id || "")) ids = [job.workflow_run_id];
+  else {
+    const wf = encodeURIComponent(env.GITHUB_WORKFLOW || "analyze-r2.yml");
+    const res = await gh(env, `/actions/workflows/${wf}/runs?event=workflow_dispatch&per_page=50`);
+    if (!res.ok) return { stopped: false, runs: 0 };
+    const data = await res.json().catch(() => null);
+    ids = (data?.workflow_runs || []).filter((r) => GH_ACTIVE_RUN.has(r.status) && String(r.display_title || r.name || "").includes(job.id)).map((r) => r.id);
+  }
+  let stopped = true;
+  for (const id of ids) {
+    const r = await gh(env, `/actions/runs/${id}/cancel`, { method: "POST" });
+    if (r.status !== 202 && r.status !== 409) stopped = false; // 409 = the run already finished
+  }
+  return { stopped, runs: ids.length };
+}
+
+async function cancelAnalysis(env, userId, job) {
+  if (!["QUEUED", "PROCESSING"].includes(job.status)) return err(409, `job is ${job.status}`);
+  if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) return err(503, "analysis backend is not configured");
+  if (!(await rateLimit(env.DB, `cancel:${userId}`, 30, 3600))) return err(429, "rate limit exceeded");
+  // Mark the job first: any late callback from the runner (started/completed/failed) is then rejected with 409.
+  if (!(await transition(env, job.id, ["QUEUED", "PROCESSING"], "FAILED", ", error_message = ?", [CANCEL_MESSAGE]))) return err(409, "job state changed");
+  let runner = { stopped: false, runs: 0 };
+  try { runner = await stopRunner(env, job); } catch { /* the job is already cancelled; the runner stops itself at its next callback */ }
+  const fresh = await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(job.id).first();
+  return json({ job: publicJob(fresh), runner_stopped: runner.stopped, runs_cancelled: runner.runs });
 }
 
 async function listJobs(env, userId, url) {
@@ -376,7 +421,7 @@ export async function handleApi(request, env) {
   if (path === "/api/jobs" && method === "POST") return createJob(env, userId, request);
   if (path === "/api/jobs" && method === "GET") return listJobs(env, userId, url);
 
-  const m = path.match(/^\/api\/jobs\/([^/]+)(?:\/(upload-url|upload-complete|analyze|results))?$/);
+  const m = path.match(/^\/api\/jobs\/([^/]+)(?:\/(upload-url|upload-complete|analyze|results|cancel))?$/);
   if (m) {
     const job = await getOwnedJob(env, userId, m[1]);
     if (!job || job.status === "DELETED") return err(404, "not found");
@@ -386,6 +431,7 @@ export async function handleApi(request, env) {
     if (sub === "upload-url" && method === "POST") return uploadUrl(env, userId, job, request);
     if (sub === "upload-complete" && method === "POST") return uploadComplete(env, userId, job, request);
     if (sub === "analyze" && method === "POST") return analyze(env, userId, job);
+    if (sub === "cancel" && method === "POST") return cancelAnalysis(env, userId, job);
     if (sub === "results" && method === "GET") return results(env, job);
   }
   return err(404, "not found");
