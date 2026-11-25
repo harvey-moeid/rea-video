@@ -1,5 +1,4 @@
-// REA VIDEO API Worker. Heavy processing never runs here: uploads go straight to R2 via presigned
-// URLs, analysis runs in GitHub Actions, results come back through an HMAC-authenticated callback.
+// REA VIDEO API Worker. Heavy processing never runs here: uploads go straight to R2 via presigned URLs, analysis runs in GitHub Actions, results come back through an HMAC-authenticated callback.
 import { SESSION_COOKIE, apiTokenConfigured, authConfigured, checkPassword, createSession, verifyApiToken, verifyCallback, verifySession } from "./auth.js";
 import { presignR2, sha256Hex } from "./sigv4.js";
 import {
@@ -205,7 +204,7 @@ async function analyze(env, userId, job) {
       "x-github-api-version": "2022-11-28", "user-agent": "rea-video-worker", "content-type": "application/json",
     },
     body: JSON.stringify({
-      ref: env.GITHUB_REF || "byga-integration",
+      ref: env.GITHUB_REF || "main",
       // inputs are server-derived only; nothing from the client body is forwarded
       inputs: { job_id: job.id, input_key: job.input_key, output_prefix: job.result_prefix, language: job.language },
     }),
