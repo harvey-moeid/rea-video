@@ -24,7 +24,7 @@ crons = ["17 */6 * * *"] # abort abandoned multipart uploads only; never deletes
 [vars]
 R2_BUCKET_NAME = "rea-video-storage"
 GITHUB_REPO = "harvey-moeid/rea-video"
-GITHUB_REF = "byga-integration"
+GITHUB_REF = "main"
 GITHUB_WORKFLOW = "analyze-r2.yml"
 MAX_UPLOAD_BYTES = "209715200"   # 200 MiB until benchmarked on a real runner
 MAX_CONCURRENT_JOBS = "2"
