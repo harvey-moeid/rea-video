@@ -1,5 +1,8 @@
 name: Analyze video from R2
 
+# Lets the Worker find (and cancel) the run of a job that is still queued.
+run-name: Analyze ${{ inputs.job_id }}
+
 # Manual / Worker-dispatched only. The Worker derives every input from D1 after checking ownership;
 # this workflow re-validates them and refuses anything that is not the canonical key layout.
 on:
