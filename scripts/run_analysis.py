@@ -31,6 +31,8 @@ SAFE_REL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]*(/[A-Za-z0-9][A-Za-z0-9._@+
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 PREFIX = re.compile(r"^users/[0-9a-f]{32}/jobs/[0-9a-f]{32}/results$")
 MAX_OBJECTS = 5000
+# `completed` makes the Worker verify every reported object, which takes longer than the small started/failed calls.
+CALLBACK_TIMEOUT = {"started": 30, "failed": 30, "completed": 120}
 
 
 class AnalysisError(Exception):
@@ -157,12 +159,13 @@ def build_callback(base_url: str, secret: str, job_id: str, event: str, payload:
     return base_url.rstrip("/") + path, headers, body
 
 
-def send_callback(base_url: str, secret: str, job_id: str, event: str, payload: dict, retries: int = 4) -> None:
+def send_callback(base_url: str, secret: str, job_id: str, event: str, payload: dict, retries: int = 4, timeout: int | None = None) -> None:
+    timeout = timeout or CALLBACK_TIMEOUT.get(event, 30)
     for attempt in range(retries):
         url, headers, body = build_callback(base_url, secret, job_id, event, payload)  # fresh nonce per attempt
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 if 200 <= r.status < 300:
                     return
         except urllib.error.HTTPError as e:
