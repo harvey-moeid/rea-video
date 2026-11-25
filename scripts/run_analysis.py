@@ -17,8 +17,10 @@ import json
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -77,6 +79,42 @@ def run_decompose(video: Path, out_dir: Path, lang: str, timeout: int, extra: li
         raise AnalysisError(f"rea-video decompose failed (exit {proc.returncode}): {tail}")
 
 
+def write_report_pdf(out_dir: Path, timeout: int = 180) -> bool:
+    """Best effort: print report.html to report.pdf with headless Chrome (`rea-video pdf`).
+
+    The PDF is a convenience, so any failure returns False and never fails the analysis. Chrome's sandbox can be
+    unavailable on locked-down runners, so a failed first attempt is retried once with --no-sandbox (through a
+    wrapper script kept outside out_dir, which is what gets uploaded).
+    """
+    pdf = out_dir / "report.pdf"
+    cmd = [sys.executable, "-m", "rea_video", "pdf", str(out_dir)]
+
+    def attempt(env=None) -> bool:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return r.returncode == 0 and pdf.is_file() and pdf.stat().st_size > 0
+
+    ok = attempt()
+    if not ok:
+        try:
+            from rea_video.pdf import find_browser
+            browser = find_browser()
+        except Exception:
+            browser = None
+        if browser:
+            with tempfile.TemporaryDirectory() as td:
+                wrapper = Path(td) / "chrome-nosandbox"
+                wrapper.write_text(f"#!/bin/sh\nexec {shlex.quote(browser)} --no-sandbox \"$@\"\n", encoding="utf-8")
+                wrapper.chmod(0o755)
+                ok = attempt({**os.environ, "REA_CHROME": str(wrapper)})
+    (out_dir / ".report_print.html").unlink(missing_ok=True)  # left behind if Chrome was killed by the timeout
+    if not ok:
+        pdf.unlink(missing_ok=True)  # never upload a partial PDF
+    return ok
+
+
 def analyze(args) -> dict:
     video, out_dir = Path(args.input), Path(args.out)
     if not video.is_file():
@@ -89,6 +127,7 @@ def analyze(args) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_decompose(video, out_dir, args.lang, args.timeout)
     summary = check_outputs(out_dir)
+    write_report_pdf(out_dir)
     objects = collect_manifest(out_dir, args.output_prefix)
     manifest = {"summary": summary, "objects": [{"key": o["key"], "size": o["size"]} for o in objects]}
     Path(args.manifest).write_text(json.dumps(manifest), encoding="utf-8")
