@@ -171,6 +171,23 @@ function cancelUpload(jobId) {
   uploads.delete(jobId);
 }
 
+// ---------- cancel a running analysis ----------
+// Calls POST /api/jobs/:id/cancel. The Worker marks the job FAILED first (so late runner callbacks are rejected)
+// and then asks GitHub to stop the Actions run. `runner_stopped: false` means the run could not be stopped from
+// here; it ends by itself at its next callback.
+async function cancelAnalysis(id, name, btn) {
+  if (!confirm(`Cancel the analysis of "${name}"? The job will be marked as failed and you can start it again later.`)) return;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api("POST", `/api/jobs/${id}/cancel`);
+    toast(r.runner_stopped ? "Analysis cancelled." : "Analysis cancelled. The GitHub run could not be stopped and will end by itself.");
+  } catch (e) {
+    toast(e.message);
+    if (btn) btn.disabled = false;
+  }
+  route();
+}
+
 // ---------- results: "Download all (ZIP)" + inline report ----------
 // Everything here runs in the browser only; the Worker is unchanged. Both features fetch the existing
 // presigned R2 links directly, so the R2 bucket's CORS policy must allow GET from this app's origin
@@ -352,13 +369,15 @@ async function viewHome() {
   if (data.jobs.some((j) => ["QUEUED", "PROCESSING"].includes(j.status))) schedulePoll(5000);
 }
 function jobRow(j) {
+  const running = ["QUEUED", "PROCESSING"].includes(j.status);
   return h("div", { class: "job" },
     h("div", { class: "row" }, h("span", { class: "name" }, j.filename), badge(j.status)),
     h("div", { class: "small muted" }, `${fmtBytes(j.size)} · ${fmtDate(j.created_at)}`),
     j.error ? h("div", { class: "small err" }, j.error) : null,
     h("div", { class: "row" },
       h("a", { class: "btn ghost", href: `#/job/${j.id}`, style: "text-decoration:none" }, "Details"),
-      h("button", { class: "btn danger", disabled: ["QUEUED", "PROCESSING"].includes(j.status), onclick: () => removeJob(j.id, j.filename) }, "Delete")));
+      running ? h("button", { class: "btn danger", onclick: (e) => cancelAnalysis(j.id, j.filename, e.currentTarget) }, "Cancel analysis") : null,
+      h("button", { class: "btn danger", disabled: running, onclick: () => removeJob(j.id, j.filename) }, "Delete")));
 }
 async function removeJob(id, name) {
   if (!confirm(`Delete "${name}" and ALL its analysis results permanently? This cannot be undone.`)) return;
@@ -378,6 +397,7 @@ async function viewJob(id) {
   const reportBox = reportFile ? h("div", { class: "card report" }, h("p", { class: "small muted" }, "Loading report…")) : null;
   const info = [["Status", badge(job.status)], ["File", job.filename], ["Size", fmtBytes(job.size)], ["Language", job.language], ["Created", fmtDate(job.created_at)], ["Started", fmtDate(job.started_at)], ["Finished", fmtDate(job.completed_at)]];
   if (job.summary) info.push(["Verdict", job.summary.verdict ?? "—"], ["Shots", job.summary.shots ?? "—"], ["Confidence", job.summary.confidence ?? "—"]);
+  const running = ["QUEUED", "PROCESSING"].includes(job.status);
   mount(
     h("p", {}, h("a", { href: "#/" }, "← All videos")),
     h("h1", {}, job.filename),
@@ -385,8 +405,9 @@ async function viewJob(id) {
     job.error ? h("p", { class: "err" }, job.error) : null,
     h("div", { class: "row" },
       ["READY", "FAILED"].includes(job.status) && job.size ? h("button", { class: "btn", onclick: async () => { try { await api("POST", `/api/jobs/${id}/analyze`); toast("Analysis queued."); } catch (e) { toast(e.message); } route(); } }, job.status === "FAILED" ? "Retry analysis" : "Start analysis") : null,
-      h("button", { class: "btn danger", disabled: ["QUEUED", "PROCESSING"].includes(job.status), onclick: async () => { await removeJob(id, job.filename); if (!document.querySelector(".badge.DELETING")) location.hash = "#/"; } }, "Delete video and results")),
-    ["QUEUED", "PROCESSING"].includes(job.status) ? h("p", { class: "muted" }, "Analysis is running on GitHub Actions. This page refreshes automatically.") : null,
+      running ? h("button", { class: "btn danger", onclick: (e) => cancelAnalysis(id, job.filename, e.currentTarget) }, "Cancel analysis") : null,
+      h("button", { class: "btn danger", disabled: running, onclick: async () => { await removeJob(id, job.filename); if (!document.querySelector(".badge.DELETING")) location.hash = "#/"; } }, "Delete video and results")),
+    running ? h("p", { class: "muted" }, "Analysis is running on GitHub Actions. This page refreshes automatically.") : null,
     reportBox ? [h("h2", {}, "Report"), reportBox] : null,
     files ? h("div", {}, h("div", { class: "row" }, h("h2", {}, "Outputs"), files.length ? h("button", { class: "btn", onclick: (e) => downloadAllZip(id, job.filename, e.currentTarget) }, "Download all (ZIP)") : null), h("p", { class: "small muted" }, "Download links expire after 5 minutes; reload to get fresh ones."),
       files.map((f) => h("div", { class: "file" }, h("a", { href: f.url, download: f.name, rel: "noopener" }, f.key), h("span", { class: "small muted" }, fmtBytes(f.size))))) : null);
